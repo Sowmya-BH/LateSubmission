@@ -1,0 +1,842 @@
+# tools/custom_tool.py
+import os
+from pathlib import Path
+from crewai_tools import FileReadTool
+from crewai import BaseTool
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+
+
+
+## -------------------------
+# TOOL INSTANCES
+# -------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+KNOWLEDGE_DIR = "financial_document_analyzer/knowledge"
+
+
+class PDFIngestionTool(BaseTool):
+    """
+    Reads a PDF file and returns its extracted text content.
+    Uses CrewAI's built-in FileReadTool safely within the project directory.
+    """
+    name: str = "pdf_ingestion_tool"
+    description: str = (
+        "Reads and extracts text content from a provided PDF path safely within the project."
+    )
+
+    def _run(self, pdf_path: str) -> str:
+        try:
+            abs_pdf_path = Path(pdf_path).resolve()
+            safe_base_path = Path(os.path.abspath(KNOWLEDGE_DIR))
+
+            # ✅ Safety check: ensure file is inside knowledge directory
+            if not os.path.commonpath([safe_base_path, abs_pdf_path]) == str(safe_base_path):
+                return f"Error: {pdf_path} is outside the allowed project directory."
+
+            if not abs_pdf_path.exists():
+                return f"Error: PDF file not found at {pdf_path}"
+
+            # ✅ Use CrewAI FileReadTool
+            file_tool = FileReadTool(file_path=str(abs_pdf_path))
+            content = file_tool.run()
+
+            return f"PDF successfully read. Extracted content length: {len(content)} chars."
+
+        except Exception as e:
+            return f"Error during PDF ingestion: {e}"
+
+
+class InvestmentTool(BaseTool):
+    """
+    Processes a financial document and runs an analysis query using the PDFIngestionTool.
+    """
+    name: str = "investment_tool"
+    description: str = (
+        "Processes a financial document (PDF path) and analyzes it using a given query string."
+    )
+
+    def _run(self, input_string: str) -> str:
+        try:
+            parts = [p.strip() for p in input_string.split(',', 1)]
+            if len(parts) != 2:
+                return "Error: Input must be in format 'PDF_PATH, QUERY_STRING'."
+
+            pdf_path, query = parts
+
+            # ✅ Step 1: Read PDF using PDFIngestionTool
+            ingestion_tool = PDFIngestionTool()
+            read_status = ingestion_tool._run(pdf_path)
+
+            if "Error" in read_status:
+                return read_status
+
+            # ✅ Step 2: Run your custom analysis (for now, simple placeholder)
+            logger.info(f"Running investment analysis on: {pdf_path}")
+            analysis_result = (
+                f"Analysis complete for query: '{query}'.\n"
+                f"Document processed successfully from: {pdf_path}\n"
+                f"(PDF content safely read using FileReadTool)"
+            )
+
+            return analysis_result
+
+        except Exception as e:
+            return f"Unexpected error in InvestmentTool: {e}"
+
+# class CalculatorTools():
+#     @tool("Make a calculation")
+#     def calculate(operation):
+#         """Useful to perform any mathematical calculations,
+#         like sum, minus, multiplication, division, etc.
+#         The input to this tool should be a mathematical
+#         expression, a couple examples are `200*7` or `50/2`
+#         """
+#         return eval(operation)
+
+
+##TOOLS.PY
+load_dotenv()
+from chromadb.utils.embedding_functions import CohereEmbeddingFunction
+
+
+KNOWLEDGE_DIR = os.path.join(BASE_DIR, "knowledge")
+
+directory_reader = DirectoryReadTool(directory=KNOWLEDGE_DIR)
+# file_reader = FileReadTool()
+search_tool = SerperDevTool()
+scrape_tool = ScrapeWebsiteTool()
+
+
+from crewai_tools import (
+    DirectoryReadTool,
+    FileReadTool,
+    SerperDevTool,
+    ScrapeWebsiteTool,
+)
+
+
+def retry_groq_api(func):
+    """Simple decorator for Groq API exponential backoff retry."""
+    def wrapper(*args, **kwargs):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except APIError as e:
+                logger.warning(f"Groq API Error on attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    raise
+                # Exponential backoff
+                sleep_time = 2 ** attempt
+                time.sleep(sleep_time)
+        return None
+    return wrapper
+
+
+
+
+import tabula
+class PDFTriageProcessor:
+    """
+    Handles PDF ingestion, triaging (small vs. large files), chunking,
+    table extraction, and vector storage (ChromaDB with Cohere).
+    """
+    # --- Triage Configuration ---
+    SMALL_FILE_MAX_PAGES = 50
+    SMALL_FILE_MAX_SIZE_MB = 100
+    SMALL_CHUNK_SIZE = 1024
+    LARGE_CHUNK_SIZE = 400
+    MAX_TABLES_BEFORE_FLUSH = 10
+
+    def __init__(self, cohere_api_key: str = None, groq_api_key: str = None, chroma_persist_dir: str = "./chroma_db"):
+        self.cohere_api_key = cohere_api_key or os.getenv("COHERE_API_KEY")
+        self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
+
+        self.cohere_ef = CohereEmbeddingFunction(
+            api_key=self.cohere_api_key,
+            model_name="embed-english-v3.0"
+        )
+        self.groq_client = Groq(api_key=self.groq_api_key)
+        self.chroma_client = chromadb.PersistentClient(path=chroma_persist_dir)
+        self.text_collection = self._get_or_create_collection("pdf_texts")
+        self.table_collection = self._get_or_create_collection("pdf_tables")
+
+        self.batch_size = 50
+        self.max_memory_pages = 50
+
+    # --- Utility Methods ---
+
+    def _get_or_create_collection(self, name: str):
+        try:
+            return self.chroma_client.get_collection(name)
+        except:
+            return self.chroma_client.create_collection(
+                name=name,
+                embedding_function=self.cohere_ef,
+                metadata={"description": f"Storage for {name} with Cohere embeddings"}
+            )
+
+    def _get_pdf_metadata_and_size(self, pdf_path: str) -> Dict[str, Any]:
+        """Get total number of pages and file size in MB"""
+        # ... (Implementation remains the same)
+        try:
+            file_size_bytes = os.path.getsize(pdf_path)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = pypdf.PdfReader(file)
+                return {
+                    "total_pages": len(pdf_reader.pages),
+                    "file_size_mb": file_size_mb,
+                    "pdf_reader": pdf_reader
+                }
+        except Exception as e:
+            logger.error(f"Error reading PDF metadata: {e}")
+            return {"total_pages": 0, "file_size_mb": 0, "pdf_reader": None}
+
+    def _chunk_text(self, text: str, page_num: int, document_name: str, chunk_size: int) -> List[Dict[str, Any]]:
+        """Generic chunking function using a specific chunk_size."""
+        # ... (Implementation remains the same)
+        chunks = []
+        chunk_id = 0
+
+        sentences = [s.strip() + '.' for s in text.split('.') if s.strip()]
+        current_chunk = []
+        current_length = 0
+
+        for sentence in sentences:
+            sentence_length = len(sentence)
+            if current_length + sentence_length <= chunk_size:
+                current_chunk.append(sentence)
+                current_length += sentence_length
+            else:
+                if current_chunk:
+                    chunk_text = ' '.join(current_chunk)
+                    chunks.append({
+                        "chunk_id": f"{document_name}_p{page_num}_c{chunk_id}",
+                        "text": chunk_text,
+                        "page": page_num,
+                        "document": document_name,
+                        "char_count": len(chunk_text)
+                    })
+                    chunk_id += 1
+
+                current_chunk = [sentence]
+                current_length = sentence_length
+
+        if current_chunk:
+            chunk_text = ' '.join(current_chunk)
+            chunks.append({
+                "chunk_id": f"{document_name}_p{page_num}_c{chunk_id}",
+                "text": chunk_text,
+                "page": page_num,
+                "document": document_name,
+                "char_count": len(chunk_text)
+            })
+
+        return chunks
+
+    def _format_table_data(self, df: pd.DataFrame, source: str, document_name: str, page_num: int) -> Dict[str, Any]:
+        """Formats a pandas DataFrame into the standardized dictionary format."""
+        table_text = df.to_markdown(index=False)
+        return {
+            "table_id": f"{document_name}_p{page_num}_t{uuid.uuid4().hex[:6]}",
+            "sample_text": table_text,
+            "page": page_num,
+            "document": document_name,
+            "shape": df.shape,
+            "method": source,
+            "columns": df.columns.tolist()
+        }
+
+    def _extract_tables_from_page(self, pdf_path: str, page_num: int, document_name: str) -> List[Dict[str, Any]]:
+        """Consolidated method to extract tables from a single page using Camelot/Tabula."""
+        extracted_tables = []
+        page_str = str(page_num)
+
+        # --- Try Camelot (Primary) ---
+        try:
+            import camelot
+            tables = camelot.read_pdf(
+                pdf_path, pages=page_str, flavor='lattice', suppress_stdout=True
+            )
+            for table in tables:
+                if table.parsing_report['accuracy'] > 80:
+                    table_data = self._format_table_data(table.df, "Camelot-Lattice", document_name, page_num)
+                    extracted_tables.append(table_data)
+
+            if extracted_tables:
+                logger.info(f"Camelot found {len(extracted_tables)} high-confidence tables on page {page_num}.")
+                return extracted_tables
+
+        except ImportError:
+            logger.warning("Camelot not installed or failed to import.")
+        except Exception as e:
+            logger.warning(f"Camelot error on page {page_num}: {e}")
+
+        # --- Try Tabula (Fallback) ---
+        try:
+            import tabula
+            tabula_tables = tabula.read_pdf(
+                pdf_path, pages=page_str, multiple_tables=True, lattice=False
+            )
+            for df in tabula_tables:
+                if not df.empty and df.shape[0] > 1:
+                    table_data = self._format_table_data(df, "Tabula-Stream", document_name, page_num)
+                    extracted_tables.append(table_data)
+
+            if extracted_tables:
+                logger.info(f"Tabula (Fallback) found {len(extracted_tables)} tables on page {page_num}.")
+
+        except ImportError:
+            logger.warning("Tabula not installed or failed to import.")
+        except Exception as e:
+            logger.warning(f"Tabula error on page {page_num}: {e}")
+
+        return extracted_tables
+
+    def _store_batch_in_chromadb(self, text_chunks: List[Dict], tables: List[Dict],
+                                 document_name: str, metadata: Dict) -> Dict[str, Any]:
+        """Store a batch of content in ChromaDB with rate limiting"""
+        # ... (Implementation remains the same)
+        storage_result = {
+            "text_embeddings_stored": 0,
+            "table_embeddings_stored": 0
+        }
+
+        try:
+            if text_chunks:
+                for i in range(0, len(text_chunks), self.batch_size):
+                    batch_texts = text_chunks[i:i + self.batch_size]
+
+                    texts = [chunk["text"] for chunk in batch_texts]
+                    ids = [chunk["chunk_id"] for chunk in batch_texts]
+                    metadatas = [{
+                        "document": document_name,
+                        "page": chunk["page"],
+                        "type": "text_chunk",
+                        "char_count": chunk["char_count"],
+                        "embedding_model": "cohere-embed-english-v3.0",
+                        **metadata
+                    } for chunk in batch_texts]
+
+                    self.text_collection.add(
+                        documents=texts,
+                        metadatas=metadatas,
+                        ids=ids
+                    )
+                    storage_result["text_embeddings_stored"] += len(batch_texts)
+                    time.sleep(0.1)
+
+            if tables:
+                table_texts = [table["sample_text"] for table in tables]
+                table_ids = [table["table_id"] for table in tables]
+                table_metadatas = [{
+                    "document": document_name,
+                    "method": table["method"],
+                    "columns": str(table["columns"]),
+                    "shape": str(table["shape"]),
+                    "type": "table",
+                    "embedding_model": "cohere-embed-english-v3.0",
+                    **metadata
+                } for table in tables]
+
+                self.table_collection.add(
+                    documents=table_texts,
+                    metadatas=table_metadatas,
+                    ids=table_ids
+                )
+                storage_result["table_embeddings_stored"] += len(tables)
+
+            logger.info(
+                f"Stored batch: {storage_result['text_embeddings_stored']} text chunks, {storage_result['table_embeddings_stored']} tables")
+
+        except Exception as e:
+            logger.error(f"Error storing batch: {e}")
+
+        return storage_result
+
+    def _prepare_query_context(self, text_results, table_results, max_context_length: int = 4000) -> str:
+        """Prepare context from results"""
+        context_parts = []
+        current_length = 0
+
+        if text_results and text_results['documents']:
+            for i, doc in enumerate(text_results['documents'][0]):
+                if current_length + len(doc) < max_context_length:
+                    metadata = text_results['metadatas'][0][i]
+                    context_parts.append(f"Page {metadata.get('page', '?')}: {doc}")
+                    current_length += len(doc)
+
+        if table_results and table_results['documents']:
+            for i, doc in enumerate(table_results['documents'][0]):
+                if current_length + len(doc) < max_context_length:
+                    metadata = table_results['metadatas'][0][i]
+                    context_parts.append(f"Table {metadata.get('method', '?')}: {doc}")
+                    current_length += len(doc)
+
+        return "\n\n".join(context_parts)
+
+    @retry_groq_api
+    async def _analyze_with_groq(self, query: str, context: str, streaming = False) -> Dict[str, Any]:
+        """Analyze with Groq"""
+        try:
+            prompt = f"""
+            Based on the following document content, answer the user's question.
+
+            DOCUMENT CONTENT:
+            {context}
+
+            QUESTION: {query}
+
+            Provide a comprehensive answer based on the available content.
+            """
+
+            response_stream = self.groq_client.chat.completions.create(
+                model="groq/llama-3.1-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=1024,
+                stream=streaming,
+            )
+
+            if streaming:
+                # Return the generator for external use (e.g., a websocket endpoint)
+                return {"answer_stream": response_stream, "model": "llama3-8b-8192"}
+
+            # If not streaming (the standard tool behavior), collect the response
+            full_response = ""
+            for chunk in response_stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    full_response += chunk.choices[0].delta.content
+
+            return {
+                "answer": full_response,
+                "model": "llama3-8b-8192"
+            }
+
+        except Exception as e:
+            return {"error": f"Groq analysis failed: {str(e)}"}
+
+    # --- Processing Core Functions (Simplified for Integration) ---
+
+    def _process_single_page(self, pdf_path: str, page, page_num: int, document_name: str) -> Dict[str, Any]:
+        """Process a single PDF page for the LARGE file path (called selectively)."""
+        page_result = {"text_chunks": [], "tables": []}
+        try:
+            text = page.extract_text()
+            if text.strip():
+                # NOTE: Using self.LARGE_CHUNK_SIZE (400)
+                chunks = self._chunk_text(text, page_num, document_name, self.LARGE_CHUNK_SIZE)
+                page_result["text_chunks"].extend(chunks)
+
+            # Extract tables (called selectively to save memory in LARGE file path)
+            # Must pass pdf_path
+            if page_num % 10 == 0:
+                tables = self._extract_tables_from_page(pdf_path, page_num, document_name)
+                page_result["tables"].extend(tables)
+
+        except Exception as e:
+            logger.warning(f"Error processing page {page_num}: {e}")
+
+        return page_result
+
+    # Large file processing helper (modified to take pdf_path)
+    def _extract_pdf_batch_with_reader(self, pdf_path: str, pdf_reader: pypdf.PdfReader, start_page: int, end_page: int,
+                                       document_name: str) -> Dict[str, Any]:
+        result = {"text_chunks": [], "tables": [], "metadata": {}}
+        try:
+            for page_num in range(start_page, end_page):
+                if page_num < len(pdf_reader.pages):
+                    page_content = self._process_single_page(
+                        pdf_path, pdf_reader.pages[page_num], page_num + 1, document_name
+                    )
+                    result["text_chunks"].extend(page_content["text_chunks"])
+                    result["tables"].extend(page_content["tables"])
+                    del page_content
+        except Exception as e:
+            logger.error(f"Error extracting batch {start_page}-{end_page}: {e}")
+        return result
+
+    # Main large file processor
+    def _process_large_pdf(self, pdf_path: str, document_name: str = None, max_pages: int = None) -> Dict[str, Any]:
+        # ... (Implementation remains the same, but calls _extract_pdf_batch_with_reader)
+        if document_name is None:
+            document_name = os.path.basename(pdf_path)
+
+        with open(pdf_path, 'rb') as file:
+            pdf_reader = pypdf.PdfReader(file)
+            total_pages = len(pdf_reader.pages)
+            file_size = os.path.getsize(pdf_path) / (1024 * 1024)
+
+            if max_pages:
+                total_pages = min(total_pages, max_pages)
+
+            logger.info(f"Processing PDF: {document_name} ({file_size:.2f} MB) in batches...")
+
+            initial_metadata = {
+                "total_pages": total_pages,
+                "title": getattr(pdf_reader.metadata, 'title', 'Unknown') if hasattr(pdf_reader.metadata,
+                                                                                     'title') else 'Unknown',
+                "author": getattr(pdf_reader.metadata, 'author', 'Unknown') if hasattr(pdf_reader.metadata,
+                                                                                       'author') else 'Unknown',
+                "extraction_date": datetime.now().isoformat(),
+                "processing_mode": "batched_memory_efficient"
+            }
+
+            all_text_chunks = []
+            all_tables = []
+
+            for batch_start in range(0, total_pages, self.max_memory_pages):
+                batch_end = min(batch_start + self.max_memory_pages, total_pages)
+                logger.info(f"Processing pages {batch_start + 1} to {batch_end}")
+
+                batch_result = self._extract_pdf_batch_with_reader(
+                    pdf_path, pdf_reader, batch_start, batch_end, document_name
+                )
+
+                all_text_chunks.extend(batch_result["text_chunks"])
+                all_tables.extend(batch_result["tables"])
+
+                if len(all_tables) >= self.MAX_TABLES_BEFORE_FLUSH:
+                    logger.info(f"Table memory flush triggered. Storing {len(all_tables)} accumulated tables.")
+                    self._store_batch_in_chromadb(
+                        [], all_tables, document_name, initial_metadata
+                    )
+                    all_tables.clear()
+                    gc.collect()
+
+                if all_text_chunks and len(
+                        all_text_chunks) > self.batch_size * 2:  # Check if a text chunk batch is also ready
+                    self._store_batch_in_chromadb(
+                        all_text_chunks, [], document_name, initial_metadata
+                    )
+                    all_text_chunks.clear()
+                    gc.collect()
+
+                    # The final store when the page batch is finished:
+                if batch_end == total_pages:  # or another final check
+                    if all_text_chunks or all_tables:
+                        self._store_batch_in_chromadb(
+                            all_text_chunks, all_tables, document_name, initial_metadata
+                        )
+                        all_text_chunks.clear()
+                        all_tables.clear()
+                        gc.collect()
+
+                logger.info(f"Completed batch {batch_start // self.max_memory_pages + 1}")
+        return {
+            "status": "success",
+            "document": document_name,
+            "total_pages_processed": total_pages,
+            "processing_mode": "batched_memory_efficient"
+        }
+
+    # Small file processing helper (modified to take pdf_path)
+    def _process_single_page_in_memory(self, pdf_path: str, page, page_num: int, document_name: str) -> Dict[str, Any]:
+        """Passes pdf_path to the table extractor."""
+        page_result = {"text_chunks": [], "tables": []}
+        try:
+            text = page.extract_text()
+            if text.strip():
+                chunks = self._chunk_text(text, page_num, document_name, self.SMALL_CHUNK_SIZE)
+                page_result["text_chunks"].extend(chunks)
+
+            # Pass pdf_path ⬇️
+            tables = self._extract_tables_from_page(pdf_path, page_num, document_name)
+            page_result["tables"].extend(tables)
+
+        except Exception as e:
+            logger.warning(f"Error processing page {page_num}: {e}")
+        return page_result
+
+    # Main small file processor
+    def _process_small_pdf(self, pdf_path: str, pdf_reader: pypdf.PdfReader, document_name: str) -> Dict[str, Any]:
+        """Process small PDFs quickly in a single synchronous block."""
+        all_text_chunks = []
+        all_tables = []
+
+        for page_num in range(len(pdf_reader.pages)):
+            page_content = self._process_single_page_in_memory(
+                pdf_path, pdf_reader.pages[page_num], page_num + 1, document_name
+            )
+            all_text_chunks.extend(page_content["text_chunks"])
+            all_tables.extend(page_content["tables"])
+
+        # ... (Metadata and Storage logic remains the same)
+        doc_metadata = {
+            "total_pages": len(pdf_reader.pages),
+            "title": getattr(pdf_reader.metadata, 'title', 'Unknown') if hasattr(pdf_reader.metadata,
+                                                                                 'title') else 'Unknown',
+            "author": getattr(pdf_reader.metadata, 'author', 'Unknown') if hasattr(pdf_reader.metadata,
+                                                                                   'author') else 'Unknown',
+            "extraction_date": datetime.now().isoformat(),
+            "processing_mode": "in_memory_fast"
+        }
+
+        storage_result = self._store_batch_in_chromadb(
+            all_text_chunks, all_tables, document_name, doc_metadata
+        )
+
+        return {
+            "status": "success",
+            "document": document_name,
+            "total_pages_processed": len(pdf_reader.pages),
+            "storage_details": storage_result,
+            "processing_mode": "in_memory_fast"
+        }
+
+    # Main Triage Router (modified to pass pdf_path)
+    def process_document(self, pdf_path: str, document_name: str = None, max_pages: int = None) -> Dict[str, Any]:
+        """Routes processing based on document size."""
+        if document_name is None:
+            document_name = os.path.basename(pdf_path)
+
+        metadata = self._get_pdf_metadata_and_size(pdf_path)
+        total_pages = metadata['total_pages']
+        file_size_mb = metadata['file_size_mb']
+        pdf_reader = metadata['pdf_reader']
+
+        if total_pages == 0:
+            return {"status": "error", "error": "Could not read PDF or page count is zero."}
+
+        is_large = (total_pages > self.SMALL_FILE_MAX_PAGES or
+                    file_size_mb > self.SMALL_FILE_MAX_SIZE_MB)
+
+        if is_large:
+            logger.info(f"Routing to LARGE file processor: {total_pages} pages, {file_size_mb:.2f} MB")
+            return self._process_large_pdf(pdf_path, document_name, max_pages)
+        else:
+            logger.info(f"Routing to SMALL file processor: {total_pages} pages, {file_size_mb:.2f} MB")
+            # Pass pdf_path to small processor ⬇️
+            return self._process_small_pdf(pdf_path, pdf_reader, document_name)
+
+    #Implement context summarization logic
+    def _summarize_context(self, context: str, query: str) -> str:
+        """Summarize context using Groq if it's too long."""
+        # Check if context length is close to the model's capacity (e.g., 6000 characters)
+        if len(context) < 6000:
+            return context
+
+        logger.info("Context is too large. Attempting to summarize.")
+
+        prompt = f"""
+        The user is asking the following question: "{query}".
+        Summarize the following document content fragments to extract the most relevant information needed to answer the question, retaining key facts and metrics.
+
+        DOCUMENT FRAGMENTS:
+        {context}
+
+        RELEVANT SUMMARY:
+        """
+        try:
+            response = self.groq_client.chat.completions.create(
+                model="llama3-8b-8192",  # Using the smaller, faster model for summarization
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=2048  # Allowing a large summary
+            )
+            summary = response.choices[0].message.content
+            logger.info(f"Context successfully summarized. Reduced from {len(context)} to {len(summary)} characters.")
+            return summary
+        except Exception as e:
+            logger.error(f"Context summarization failed: {e}. Returning truncated context.")
+            return context[:self.LARGE_CHUNK_SIZE * 5]  # Fallback to hard truncation
+
+
+    def query_documents(self, query: str, n_results: int = 10, document_filter: str = None) -> Dict[str, Any]:
+        """Query the stored embeddings, retrieve context, and analyze with Groq."""
+        try:
+            logger.info(f"Querying: '{query}'")
+
+            text_results = self.text_collection.query(
+                query_texts=[query], n_results=n_results,
+                where={"document": document_filter} if document_filter else None
+            )
+
+            table_results = self.table_collection.query(
+                query_texts=[query], n_results=n_results // 2,
+                where={"document": document_filter} if document_filter else None
+            )
+
+            context = self._prepare_query_context(text_results, table_results)
+            context = self._summarize_context(context, query)
+            analysis = self._analyze_with_groq(query, context)
+
+            return {
+                "query": query,
+                "analysis": analysis,
+                "sources_count": {
+                    "text_results": len(text_results['documents'][0]) if text_results['documents'] else 0,
+                    "table_results": len(table_results['documents'][0]) if table_results['documents'] else 0
+                }
+            }
+        except Exception as e:
+            return {"error": f"Query failed: {str(e)}"}
+
+    def get_collection_stats(self) -> Dict[str, Any]:
+        """Get statistics about stored embeddings"""
+        try:
+            text_count = self.text_collection.count()
+            table_count = self.table_collection.count()
+
+            return {
+                "text_collection_count": text_count,
+                "table_collection_count": table_count,
+                "total_embeddings": text_count + table_count,
+                "embedding_provider": "Cohere (via ChromaDB)"
+            }
+        except Exception as e:
+            return {"error": str(e)}
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- CREWAI TOOL WRAPPERS ---
+
+# Initialize the processor globally or pass it into the tool instance
+# NOTE: API keys should be loaded from .env before running.
+# Example: processor = PDFTriageProcessor()
+# We'll use a lazy/static initialization for CrewAI's BaseTool structure.
+
+SINGLETON_PROCESSOR = PDFTriageProcessor()
+
+
+class CalculatorTool(BaseTool):
+    name: str = "Calculator tool"
+    description: str = (
+        "Useful to perform any mathematical calculations, like sum, minus, multiplication, division, etc. The input to this tool should be a mathematical  expression, a couple examples are `200*7` or `5000/2*10."
+    )
+
+    def _run(self, operation: str) -> float:
+        try:
+            # Define allowed operators for safe evaluation
+            allowed_operators = {
+                ast.Add: operator.add,
+                ast.Sub: operator.sub,
+                ast.Mult: operator.mul,
+                ast.Div: operator.truediv,
+                ast.Pow: operator.pow,
+                ast.Mod: operator.mod,
+                ast.USub: operator.neg,
+                ast.UAdd: operator.pos,
+            }
+
+            # Parse and validate the expression
+            if not re.match(r'^[0-9+\-*/().% ]+$', operation):
+                raise ValueError("Invalid characters in mathematical expression")
+
+            # Parse the expression
+            tree = ast.parse(operation, mode='eval')
+
+            def _eval_node(node):
+                if isinstance(node, ast.Expression):
+                    return _eval_node(node.body)
+                elif isinstance(node, ast.Constant):  # Python 3.8+
+                    return node.value
+                elif isinstance(node, ast.Num):  # Python < 3.8
+                    return node.n
+                elif isinstance(node, ast.BinOp):
+                    left = _eval_node(node.left)
+                    right = _eval_node(node.right)
+                    op = allowed_operators.get(type(node.op))
+                    if op is None:
+                        raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+                    return op(left, right)
+                elif isinstance(node, ast.UnaryOp):
+                    operand = _eval_node(node.operand)
+                    op = allowed_operators.get(type(node.op))
+                    if op is None:
+                        raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+                    return op(operand)
+                else:
+                    raise ValueError(f"Unsupported node type: {type(node).__name__}")
+
+            result = _eval_node(tree)
+            return result
+
+        except (SyntaxError, ValueError, ZeroDivisionError, TypeError) as e:
+            raise ValueError(f"Calculation error: {str(e)}")
+        except Exception:
+            raise ValueError("Invalid mathematical expression")
+
+
+
+
+
+
+
+class InvestmentTool(BaseTool):
+    """
+    Tool for processing financial documents and analyzing investment potential.
+    Uses PDFTriageProcessor to manage ingestion and analysis.
+    """
+    name: str = "investment_tool"
+    description: str = (
+        "Processes a financial document (PDF path) for storage and runs a query "
+        "to analyze investment potential. Input must be the document path and analysis query, "
+        "e.g., 'path/to/report.pdf, Key revenue drivers in Q3'."
+    )
+    processor: PDFTriageProcessor = SINGLETON_PROCESSOR # Assign the singleton instance  # Initialize processor instance
+
+    def _run(self, input_string: str) -> str:
+        """
+        Input format: "PDF_PATH, QUERY_STRING"
+        """
+        try:
+            parts = [p.strip() for p in input_string.split(',', 1)]
+            if len(parts) != 2:
+                return "Error: Input must be in format 'PDF_PATH, QUERY_STRING'."
+
+            pdf_path, query = parts
+
+            safe_base_path = Path(os.path.abspath(KNOWLEDGE_DIR))
+
+            # Resolve the user path to an absolute path
+            abs_pdf_path = Path(pdf_path).resolve()
+
+            if not os.path.exists(abs_pdf_path):
+                return f"Error: File not found at path: {pdf_path}"
+
+            # Check if the file is inside the safe directory
+            if not os.path.commonpath([safe_base_path, abs_pdf_path]) == str(safe_base_path):
+                return "Error: File path is outside the allowed project directory."
+
+            # Use the safe absolute path for processing
+            safe_pdf_path = str(abs_pdf_path)
+
+            # 1. Ingest and Store Document
+            logger.info(f"Ingesting document: {safe_pdf_path}")
+            self.processor.process_document(safe_pdf_path)
+
+            # 2. Query and Analyze Investment Potential
+            analysis_result = self.processor.query_documents(query)
+
+            if analysis_result.get("error"):
+                return f"Investment Analysis Error: {analysis_result['error']}"
+
+            return f"Investment Analysis Result:\n{analysis_result['analysis']['answer']}\n(Sources Found: {analysis_result['sources_count']['text_results']} text chunks, {analysis_result['sources_count']['table_results']} tables)"
+
+        except Exception as e:
+            return f"An unexpected error occurred during Investment Analysis: {e}"
+
+
+
+
+import os
+from pathlib import Path
+import logging
+from crewai_tools import BaseTool, FileReadTool
+import camelot
+import pandas as pd
+
+from financial_document_analyzer.pdf_processor import PDFTriageProcessor
+from financial_document_analyzer.singleton import SINGLETON_PROCESSOR
+
+logger = logging.getLogger(__name__)
+
+# Path to the folder where uploaded docs are stored
+KNOWLEDGE_DIR = os.path.join(os.path.dirname(__file__), "../knowledge")
